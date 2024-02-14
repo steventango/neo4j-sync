@@ -1,17 +1,19 @@
 import argparse
+import asyncio
 import json
 import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from textwrap import dedent
 
-from neo4j import GraphDatabase, RoutingControl
+from neo4j import AsyncDriver, AsyncGraphDatabase, RoutingControl
 
 LOG_PATH = Path(f"logs/{Path(__file__).stem}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log")
-
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     handlers=[
         logging.FileHandler(LOG_PATH),
     ],
@@ -20,84 +22,108 @@ logging.basicConfig(
 logger = logging.getLogger()
 
 
-def write_node(driver, node):
-    n = node["n"]
+async def sync_nodes(
+    from_driver: AsyncDriver,
+    from_database: str,
+    to_driver: AsyncDriver,
+    to_database: str,
+    limit: int = -1,
+    batch_size: int = 1000,
+):
+    if limit == -1:
+        from_query = "MATCH (n) RETURN count(n) as count"
+        logger.info(from_query)
+        from_results, _, _ = await from_driver.execute_query(
+            from_query, database=from_database, routing=RoutingControl.READ
+        )
+        limit = from_results[0]["count"]
+    logger.info(f"Number of nodes to sync: {limit}")
+
+    from_queries = [
+        dedent(
+            f"""
+                MATCH (n)
+                RETURN n
+                SKIP {i}
+                LIMIT {min(batch_size, limit - i)}
+            """
+        )
+        for i in range(0, limit, batch_size)
+    ]
+    for from_query in from_queries:
+        logger.info(from_query)
+        from_results, _, _ = await from_driver.execute_query(
+            from_query, database=from_database, routing=RoutingControl.READ
+        )
+        coroutines = [merge_node(to_driver, to_database, from_result) for from_result in from_results]
+        await asyncio.gather(*coroutines)
+
+
+async def merge_node(to_driver: AsyncDriver, to_database: str, from_result: dict):
+    n = from_result["n"]
     labels = ":".join(f"`{label}`" for label in n.labels)
-    properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in n.items()) + "}"
-    query = f"MERGE (n:{labels} {properties})"
-    logger.debug(query)
-    driver.execute_query(
-        query,
-        database_="neo4j",
-        routing_=RoutingControl.WRITE,
-    )
+    properties = dict(n.items())
+    properties["_neo4j_sync_from_id"] = n.element_id
+    properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in properties.items()) + "}"
+    to_query = f"MERGE (n:{labels} {properties})"
+    logger.info(to_query)
+    await to_driver.execute_query(to_query, database=to_database, routing=RoutingControl.WRITE)
 
 
-def write_nodes(driver, nodes):
-    for node in nodes:
-        write_node(driver, node)
+async def sync_relationships(
+    from_driver: AsyncDriver,
+    from_database: str,
+    to_driver: AsyncDriver,
+    to_database: str,
+    limit: int = -1,
+    batch_size: int = 1000,
+):
+    if limit == -1:
+        from_query = "MATCH ()-[r]->() RETURN count(r) as count"
+        logger.info(from_query)
+        from_results, _, _ = await from_driver.execute_query(
+            from_query, database=from_database, routing=RoutingControl.READ
+        )
+        limit = from_results[0]["count"]
+    logger.info(f"Number of relationships to sync: {limit}")
+
+    from_queries = [
+        dedent(
+            f"""
+                MATCH ()-[r]->()
+                RETURN r
+                SKIP {i}
+                LIMIT {min(batch_size, limit - i)}
+            """
+        )
+        for i in range(0, limit, batch_size)
+    ]
+    for from_query in from_queries:
+        logger.info(from_query)
+        from_results, _, _ = await from_driver.execute_query(
+            from_query, database=from_database, routing=RoutingControl.READ
+        )
+        coroutines = [merge_relationship(to_driver, to_database, from_result) for from_result in from_results]
+        await asyncio.gather(*coroutines)
 
 
-def write_relationship(driver, relationship):
-    r = relationship["r"]
-    properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in r.items()) + "}"
-    query = f"""
-        MATCH (n) WHERE ID(n) = {r.start_node.element_id}
-        MATCH (m) WHERE ID(m) = {r.end_node.element_id}
-        MERGE (n)-[r:{r.type} {properties}]->(m)
-    """
-    logger.debug(query)
-    driver.execute_query(
-        query,
-        database_="neo4j",
-        routing_=RoutingControl.WRITE,
-    )
-
-
-def write_relationships(driver, relationships):
-    for relationship in relationships:
-        write_relationship(driver, relationship)
-
-
-def read_nodes(driver, limit: int = -1):
-    query = """
-        MATCH (n)
-        RETURN n
-    """
-    if limit > 0:
-        query += f"""
-        LIMIT {limit}
+async def merge_relationship(to_driver: AsyncDriver, to_database: str, from_result: dict):
+    r = from_result["r"]
+    properties = dict(r.items())
+    properties["_neo4j_sync_from_id"] = r.element_id
+    properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in properties.items()) + "}"
+    to_query = dedent(
+        f"""
+            MATCH (n {{`_neo4j_sync_from_id`: {r.start_node.element_id}}})
+            MATCH (m {{`_neo4j_sync_from_id`: {r.end_node.element_id}}})
+            MERGE (n)-[r:{r.type} {properties}]->(m)
         """
-    logger.debug(query)
-    records, _, _ = driver.execute_query(
-        query,
-        database_="neo4j",
-        routing_=RoutingControl.READ,
     )
-    return records
+    logger.info(to_query)
+    await to_driver.execute_query(to_query, database=to_database, routing=RoutingControl.WRITE)
 
 
-def read_relationships(driver, limit: int = -1):
-    # TODO DUMB, should split into batches
-    # OOM
-    query = """
-        MATCH (n)-[r]->(m)
-        RETURN r
-    """
-    if limit > 0:
-        query += f"""
-        LIMIT {limit}
-        """
-    logger.debug(query)
-    records, _, _ = driver.execute_query(
-        query,
-        database_="neo4j",
-        routing_=RoutingControl.READ,
-    )
-    return records
-
-
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Sync Neo4j databases")
     parser.add_argument(
         "--from-uri",
@@ -124,6 +150,12 @@ def main():
         help="Password of the source Neo4j database",
     )
     parser.add_argument(
+        "--from-database",
+        type=str,
+        default="neo4j",
+        help="Name of the source Neo4j database",
+    )
+    parser.add_argument(
         "--to-user",
         type=str,
         default="",
@@ -136,35 +168,47 @@ def main():
         help="Password of the destination Neo4j database",
     )
     parser.add_argument(
+        "--to-database",
+        type=str,
+        default="neo4j",
+        help="Name of the destination Neo4j database",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=-1,
         help="Limit the number of nodes and relationships to sync",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Batch size for syncing nodes and relationships",
+    )
     args = parser.parse_args()
 
-    with GraphDatabase.driver(args.from_uri, auth=(args.from_user, args.from_password)) as from_driver, GraphDatabase.driver(args.to_uri, auth=(args.to_user, args.to_password)) as to_driver:
-        logging.info("Reading nodes from disease.ncats.io")
+    async with AsyncGraphDatabase.driver(
+        args.from_uri,
+        auth=(args.from_user, args.from_password),
+    ) as from_driver, AsyncGraphDatabase.driver(
+        args.to_uri,
+        auth=(args.to_user, args.to_password),
+    ) as to_driver:
+        logging.info(f"Syncing nodes from {args.from_uri} to {args.to_uri}")
         start = time.time()
-        nodes = read_nodes(from_driver)
+        await sync_nodes(from_driver, args.from_database, to_driver, args.to_database, args.limit, args.batch_size)
         end = time.time()
-        logging.info(f"Time to read nodes from disease.ncats.io: {timedelta(seconds=end - start)}")
-        logging.info("Writing nodes to local")
+        logging.info(f"Time to sync nodes from {args.from_uri} to {args.to_uri}: {timedelta(seconds=end - start)}")
+        logging.info(f"Syncing relationships from {args.from_uri} to {args.to_uri}")
         start = time.time()
-        write_nodes(to_driver, nodes)
+        await sync_relationships(
+            from_driver, args.from_database, to_driver, args.to_database, args.limit, args.batch_size
+        )
         end = time.time()
-        logging.info(f"Time to write nodes to local: {timedelta(seconds=end - start)}")
-        logging.info("Reading relationships from disease.ncats.io")
-        start = time.time()
-        relationships = read_relationships(from_driver)
-        end = time.time()
-        logging.info(f"Time to read relationships from disease.ncats.io: {timedelta(seconds=end - start)}")
-        logging.info("Writing relationships to local")
-        start = time.time()
-        write_relationships(to_driver, relationships)
-        end = time.time()
-        logging.info(f"Time to write relationships to local: {timedelta(seconds=end - start)}")
+        logging.info(
+            f"Time to sync relationships from {args.from_uri} to {args.to_uri}: {timedelta(seconds=end - start)}"
+        )
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

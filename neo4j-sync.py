@@ -163,6 +163,7 @@ def main():
         start = time.time()
         write_relationships(to_driver, relationships)
         end = time.time()
+        logging.info(f"Time to write relationships to local: {timedelta(seconds=end - start)}")
 
 
 if __name__ == "__main__":

@@ -11,10 +11,12 @@ have the apoc plugin installed.
 ```bash
 pip install -r requirements.txt
 python neo4j-sync --source-uri bolt://localhost:7687 --source-user neo4j --source-password neo4j --target-uri bolt://localhost:7687 --target-user neo4j --target-password neo4j
+python neo4j-sync --from-uri neo4j+ssc://disease.ncats.io:7687 --target-uri neo4j://neo4j:7687 --from-user "" --from-password "" --target-user neo4j --target-password "12345678"
 ```
 
 Alternatively, you can use docker to run the tool:
 
 ```bash
-docker run -it --rm -e SOURCE_URI=bolt://localhost:7687 -e SOURCE_USER=neo4j -e SOURCE_PASSWORD=neo4j -e TARGET_URI=bolt://localhost:7687 -e TARGET_USER=neo4j -e TARGET_PASSWORD=neo4j neo4j-sync
+docker build -t neo4j-sync .
+docker run -it --rm neo4j-sync python --source-uri bolt://localhost:7687 --source-user neo4j --source-password neo4j --target-uri bolt://localhost:7687 --target-user neo4j --target-password neo4j
 ```

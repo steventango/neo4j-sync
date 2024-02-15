@@ -2,7 +2,9 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import time
+from asyncio import Semaphore
 from datetime import datetime, timedelta
 from pathlib import Path
 from textwrap import dedent
@@ -50,24 +52,26 @@ async def sync_nodes(
         )
         for i in range(0, limit, batch_size)
     ]
+    semaphore = Semaphore(os.cpu_count())
     for from_query in from_queries:
         logger.info(from_query)
         from_results, _, _ = await from_driver.execute_query(
             from_query, database=from_database, routing=RoutingControl.READ
         )
-        coroutines = [create_node(to_driver, to_database, from_result) for from_result in from_results]
+        coroutines = [create_node(to_driver, to_database, from_result, semaphore) for from_result in from_results]
         await asyncio.gather(*coroutines)
 
 
-async def create_node(to_driver: AsyncDriver, to_database: str, from_result: dict):
-    n = from_result["n"]
-    labels = ":".join(f"`{label}`" for label in n.labels)
-    properties = dict(n.items())
-    properties["_neo4j_sync_from_id"] = n.element_id
-    properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in properties.items()) + "}"
-    to_query = f"CREATE (n:{labels} {properties})"
-    logger.info(to_query)
-    await to_driver.execute_query(to_query, database=to_database, routing=RoutingControl.WRITE)
+async def create_node(to_driver: AsyncDriver, to_database: str, from_result: dict, semaphore: Semaphore):
+    async with semaphore:
+        n = from_result["n"]
+        labels = ":".join(f"`{label}`" for label in n.labels)
+        properties = dict(n.items())
+        properties["_neo4j_sync_from_id"] = n.element_id
+        properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in properties.items()) + "}"
+        to_query = f"CREATE (n:{labels} {properties})"
+        logger.info(to_query)
+        await to_driver.execute_query(to_query, database=to_database, routing=RoutingControl.WRITE)
 
 
 async def sync_relationships(
@@ -98,29 +102,31 @@ async def sync_relationships(
         )
         for i in range(0, limit, batch_size)
     ]
+    semaphore = Semaphore(os.cpu_count())
     for from_query in from_queries:
         logger.info(from_query)
         from_results, _, _ = await from_driver.execute_query(
             from_query, database=from_database, routing=RoutingControl.READ
         )
-        coroutines = [create_relationship(to_driver, to_database, from_result) for from_result in from_results]
+        coroutines = [create_relationship(to_driver, to_database, from_result, semaphore) for from_result in from_results]
         await asyncio.gather(*coroutines)
 
 
-async def create_relationship(to_driver: AsyncDriver, to_database: str, from_result: dict):
-    r = from_result["r"]
-    properties = dict(r.items())
-    properties["_neo4j_sync_from_id"] = r.element_id
-    properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in properties.items()) + "}"
-    to_query = dedent(
-        f"""
-            MATCH (n {{`_neo4j_sync_from_id`: {r.start_node.element_id}}})
-            MATCH (m {{`_neo4j_sync_from_id`: {r.end_node.element_id}}})
-            CREATE (n)-[r:{r.type} {properties}]->(m)
-        """
-    )
-    logger.info(to_query)
-    await to_driver.execute_query(to_query, database=to_database, routing=RoutingControl.WRITE)
+async def create_relationship(to_driver: AsyncDriver, to_database: str, from_result: dict, semaphore: Semaphore):
+    async with semaphore:
+        r = from_result["r"]
+        properties = dict(r.items())
+        properties["_neo4j_sync_from_id"] = r.element_id
+        properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in properties.items()) + "}"
+        to_query = dedent(
+            f"""
+                MATCH (n {{`_neo4j_sync_from_id`: "{r.start_node.element_id}"}})
+                MATCH (m {{`_neo4j_sync_from_id`: "{r.end_node.element_id}"}})
+                CREATE (n)-[r:{r.type} {properties}]->(m)
+            """
+        )
+        logger.info(to_query)
+        await to_driver.execute_query(to_query, database=to_database, routing=RoutingControl.WRITE)
 
 
 async def main():

@@ -65,7 +65,8 @@ async def sync_nodes(
 async def create_node(to_driver: AsyncDriver, to_database: str, from_result: dict, semaphore: Semaphore):
     async with semaphore:
         n = from_result["n"]
-        labels = ":".join(f"`{label}`" for label in n.labels)
+        labels = n.labels + ["_neo4j_sync_node"]
+        labels = ":".join(f"`{label}`" for label in labels)
         properties = dict(n.items())
         properties["_neo4j_sync_from_id"] = n.element_id
         properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in properties.items()) + "}"
@@ -83,7 +84,7 @@ async def sync_relationships(
     batch_size: int = 1000,
 ):
     if limit == -1:
-        from_query = "MATCH ()-[r]->() RETURN count(r) as count"
+        from_query = "MATCH (n)-[r]->(m) RETURN count(r) as count"
         logger.info(from_query)
         from_results, _, _ = await from_driver.execute_query(
             from_query, database=from_database, routing=RoutingControl.READ
@@ -91,10 +92,19 @@ async def sync_relationships(
         limit = from_results[0]["count"]
     logger.info(f"Number of relationships to sync: {limit}")
 
+    create_index_query = dedent(
+        """
+            CREATE RANGE INDEX node_range_index__neo4j_sync_node__neo4j_sync_from_id IF NOT EXISTS
+            FOR (n:_neo4j_sync_node)
+            ON (n._neo4j_sync_from_id)
+        """
+    )
+    logger.info(create_index_query)
+    await to_driver.execute_query(create_index_query, database=to_database, routing=RoutingControl.WRITE)
     from_queries = [
         dedent(
             f"""
-                MATCH ()-[r]->()
+                MATCH (n)-[r]->(m)
                 RETURN r
                 SKIP {i}
                 LIMIT {min(batch_size, limit - i)}
@@ -108,7 +118,9 @@ async def sync_relationships(
         from_results, _, _ = await from_driver.execute_query(
             from_query, database=from_database, routing=RoutingControl.READ
         )
-        coroutines = [create_relationship(to_driver, to_database, from_result, semaphore) for from_result in from_results]
+        coroutines = [
+            create_relationship(to_driver, to_database, from_result, semaphore) for from_result in from_results
+        ]
         await asyncio.gather(*coroutines)
 
 
@@ -120,8 +132,8 @@ async def create_relationship(to_driver: AsyncDriver, to_database: str, from_res
         properties = "{" + ", ".join(f"`{key}`: {json.dumps(value)}" for key, value in properties.items()) + "}"
         to_query = dedent(
             f"""
-                MATCH (n {{`_neo4j_sync_from_id`: "{r.start_node.element_id}"}})
-                MATCH (m {{`_neo4j_sync_from_id`: "{r.end_node.element_id}"}})
+                MATCH (n:_neo4j_sync_node {{`_neo4j_sync_from_id`: "{r.start_node.element_id}"}})
+                MATCH (m:_neo4j_sync_node {{`_neo4j_sync_from_id`: "{r.end_node.element_id}"}})
                 CREATE (n)-[r:{r.type} {properties}]->(m)
             """
         )

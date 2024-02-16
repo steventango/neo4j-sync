@@ -31,6 +31,7 @@ async def sync_nodes(
     to_database: str,
     limit: int = -1,
     batch_size: int = 1000,
+    start: int = 0,
 ):
     if limit == -1:
         from_query = "MATCH (n) RETURN count(n) as count"
@@ -50,7 +51,7 @@ async def sync_nodes(
                 LIMIT {min(batch_size, limit - i)}
             """
         )
-        for i in range(0, limit, batch_size)
+        for i in range(start, limit, batch_size)
     ]
     semaphore = Semaphore(os.cpu_count())
     for from_query in from_queries:
@@ -82,6 +83,7 @@ async def sync_relationships(
     to_database: str,
     limit: int = -1,
     batch_size: int = 1000,
+    start: int = 0,
 ):
     if limit == -1:
         from_query = "MATCH (n)-[r]->(m) RETURN count(r) as count"
@@ -110,7 +112,7 @@ async def sync_relationships(
                 LIMIT {min(batch_size, limit - i)}
             """
         )
-        for i in range(0, limit, batch_size)
+        for i in range(start, limit, batch_size)
     ]
     semaphore = Semaphore(os.cpu_count())
     for from_query in from_queries:
@@ -192,18 +194,53 @@ async def main():
         help="Name of the destination Neo4j database",
     )
     parser.add_argument(
-        "--limit",
+        "--nodes-limit",
         type=int,
         default=-1,
-        help="Limit the number of nodes and relationships to sync",
+        help="Limit the number of nodes to sync",
     )
     parser.add_argument(
-        "--batch-size",
+        "--relationships-limit",
+        type=int,
+        default=-1,
+        help="Limit the number of relationships to sync",
+    )
+    parser.add_argument(
+        "--nodes-batch-size",
         type=int,
         default=1000,
-        help="Batch size for syncing nodes and relationships",
+        help="Batch size for syncing nodes",
+    )
+    parser.add_argument(
+        "--relationships-batch-size",
+        type=int,
+        default=1000,
+        help="Batch size for syncing relationships",
+    )
+    parser.add_argument(
+        "--nodes-start",
+        type=int,
+        default=0,
+        help="Start index for syncing nodes",
+    )
+    parser.add_argument(
+        "--relationships-start",
+        type=int,
+        default=0,
+        help="Start index for syncing relationships",
+    )
+    parser.add_argument(
+        "--skip-nodes",
+        action="store_true",
+        help="Skip syncing nodes",
+    )
+    parser.add_argument(
+        "--skip-relationships",
+        action="store_true",
+        help="Skip syncing relationships",
     )
     args = parser.parse_args()
+    logging.info(args)
 
     async with AsyncGraphDatabase.driver(
         args.from_uri,
@@ -212,20 +249,36 @@ async def main():
         args.to_uri,
         auth=(args.to_user, args.to_password),
     ) as to_driver:
-        logging.info(f"Syncing nodes from {args.from_uri} to {args.to_uri}")
-        start = time.time()
-        await sync_nodes(from_driver, args.from_database, to_driver, args.to_database, args.limit, args.batch_size)
-        end = time.time()
-        logging.info(f"Time to sync nodes from {args.from_uri} to {args.to_uri}: {timedelta(seconds=end - start)}")
-        logging.info(f"Syncing relationships from {args.from_uri} to {args.to_uri}")
-        start = time.time()
-        await sync_relationships(
-            from_driver, args.from_database, to_driver, args.to_database, args.limit, args.batch_size
-        )
-        end = time.time()
-        logging.info(
-            f"Time to sync relationships from {args.from_uri} to {args.to_uri}: {timedelta(seconds=end - start)}"
-        )
+        if not args.skip_nodes:
+            logging.info(f"Syncing nodes from {args.from_uri} to {args.to_uri}")
+            start = time.time()
+            await sync_nodes(
+                from_driver,
+                args.from_database,
+                to_driver,
+                args.to_database,
+                args.nodes_limit,
+                args.nodes_batch_size,
+                args.nodes_start,
+            )
+            end = time.time()
+            logging.info(f"Time to sync nodes from {args.from_uri} to {args.to_uri}: {timedelta(seconds=end - start)}")
+        if not args.skip_relationships:
+            logging.info(f"Syncing relationships from {args.from_uri} to {args.to_uri}")
+            start = time.time()
+            await sync_relationships(
+                from_driver,
+                args.from_database,
+                to_driver,
+                args.to_database,
+                args.relationships_limit,
+                args.relationships_batch_size,
+                args.relationships_start,
+            )
+            end = time.time()
+            logging.info(
+                f"Time to sync relationships from {args.from_uri} to {args.to_uri}: {timedelta(seconds=end - start)}"
+            )
 
 
 if __name__ == "__main__":
